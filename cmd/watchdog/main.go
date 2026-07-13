@@ -265,6 +265,64 @@ func cmdName(pid int) string {
 // alive teste l'existence d'un process (signal 0).
 func alive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 
+// readMem lit /proc/meminfo et renvoie (utilisée, totale) en octets.
+func readMem() (used, total uint64) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0
+	}
+	var memTotal, memAvail uint64
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line) // "MemTotal:  32768000 kB"
+		if len(f) < 2 {
+			continue
+		}
+		kb, err := strconv.ParseUint(f[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch f[0] {
+		case "MemTotal:":
+			memTotal = kb * 1024
+		case "MemAvailable:":
+			memAvail = kb * 1024
+		}
+	}
+	if memAvail > memTotal {
+		memAvail = memTotal
+	}
+	return memTotal - memAvail, memTotal
+}
+
+// readCPU lit la première ligne de /proc/stat et renvoie le cumul de jiffies
+// (total, inactif) depuis le démarrage. La différence entre deux relevés donne
+// le taux d'occupation CPU.
+func readCPU() (total, idle uint64) {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, 0
+	}
+	line := data
+	if i := strings.IndexByte(string(data), '\n'); i >= 0 {
+		line = data[:i]
+	}
+	f := strings.Fields(string(line)) // "cpu user nice system idle iowait irq softirq steal ..."
+	if len(f) < 5 || f[0] != "cpu" {
+		return 0, 0
+	}
+	for i := 1; i < len(f); i++ {
+		v, err := strconv.ParseUint(f[i], 10, 64)
+		if err != nil {
+			continue
+		}
+		total += v
+		if i == 4 || i == 5 { // idle + iowait
+			idle += v
+		}
+	}
+	return total, idle
+}
+
 // ─── Messages & commandes Bubble Tea ────────────────────────────────────────
 
 type procRow struct {
@@ -383,9 +441,33 @@ type model struct {
 	width       int          // dimensions du terminal (0 tant qu'inconnues)
 	height      int
 	lastErr     string
+
+	// Statistiques système, rafraîchies à chaque tick d'affichage.
+	memUsed    uint64  // RAM utilisée (octets)
+	memTotal   uint64  // RAM totale (octets)
+	cpuPct     float64 // occupation CPU système (%)
+	prevCPUTot uint64  // relevé /proc/stat précédent (pour le delta)
+	prevCPUIdl uint64
 }
 
-func initialModel() model { return model{start: time.Now(), notified: map[int]bool{}} }
+func initialModel() model {
+	m := model{start: time.Now(), notified: map[int]bool{}}
+	m.prevCPUTot, m.prevCPUIdl = readCPU()
+	m.memUsed, m.memTotal = readMem()
+	return m
+}
+
+// refreshSysStats met à jour la RAM et le CPU système (delta depuis le relevé
+// précédent). À appeler périodiquement (tick d'affichage).
+func (m *model) refreshSysStats() {
+	m.memUsed, m.memTotal = readMem()
+	total, idle := readCPU()
+	if dt := total - m.prevCPUTot; total > m.prevCPUTot && dt > 0 {
+		di := idle - m.prevCPUIdl
+		m.cpuPct = float64(dt-di) / float64(dt) * 100
+	}
+	m.prevCPUTot, m.prevCPUIdl = total, idle
+}
 
 // visibleRows calcule combien de lignes de process peuvent être affichées, en
 // retranchant de la hauteur du terminal la place occupée par le reste de
@@ -397,8 +479,9 @@ func (m model) visibleRows() int {
 		// Lignes occupées par tout sauf les lignes de process :
 		//   en-tête encadré (6) + ligne vide (1) + en-tête de colonnes (1) +
 		//   ligne vide finale du tableau (1) + ligne d'état (1) +
-		//   séparateur du journal (1) + pied de page (2) + marge (1).
-		overhead := 6 + 1 + 1 + 1 + 1 + 1 + 2 + 1
+		//   séparateur du journal (1) + barre système (1) + pied de page (1) +
+		//   marge (1).
+		overhead := 6 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
 		if len(m.events) > 0 {
 			overhead += len(m.events) + 2 // titre + ligne vide du journal
 		}
@@ -591,7 +674,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		return m, scan
 	case uiTickMsg:
-		// Simple rafraîchissement de l'affichage (compte à rebours).
+		// Rafraîchit l'affichage (compte à rebours) et les stats système.
+		m.refreshSysStats()
 		return m, uiTick()
 	}
 	return m, nil
@@ -615,6 +699,22 @@ var (
 			BorderForeground(cBorder).
 			Padding(0, 2)
 )
+
+// clip tronque une chaîne (sans séquences ANSI) à w colonnes, avec une ellipse
+// si elle dépasse. w <= 0 renvoie une chaîne vide.
+func clip(s string, w int) string {
+	r := []rune(s)
+	if len(r) <= w {
+		return s
+	}
+	if w <= 0 {
+		return ""
+	}
+	if w == 1 {
+		return "…"
+	}
+	return string(r[:w-1]) + "…"
+}
 
 // human formate des octets en Ko / Mo / Go.
 func human(b uint64) string {
@@ -693,13 +793,20 @@ func (m model) View() string {
 	if len(perPatternLimit) > 0 {
 		seuilLabel = "seuil déf.: "
 	}
+	// Largeur utile du contenu de l'en-tête (cadre plein écran : largeur du
+	// terminal moins bordure (2) et padding (4)). Les lignes sont tronquées à
+	// cette largeur pour ne jamais se replier (ce qui casserait la hauteur).
+	contentW := 1 << 30
+	if m.width > 6 {
+		contentW = m.width - 6
+	}
 	header := lipgloss.JoinVertical(
 		lipgloss.Left,
 		titleStyle.Render("Memory Watchdog"),
-		dimStyle.Render(cibleLabel+strings.Join(parts, ", ")),
-		dimStyle.Render(fmt.Sprintf("%s%s   ·   intervalle : %s   ·   uptime : %s   ·   scans : %d",
-			seuilLabel, human(limitBytes), interval, up, m.scans)),
-		dimStyle.Render(fmt.Sprintf("dernier   : %s   ·   prochain   : %s", last, next)),
+		dimStyle.Render(clip(cibleLabel+strings.Join(parts, ", "), contentW)),
+		dimStyle.Render(clip(fmt.Sprintf("%s%s   ·   intervalle : %s   ·   uptime : %s   ·   scans : %d",
+			seuilLabel, human(limitBytes), interval, up, m.scans), contentW)),
+		dimStyle.Render(clip(fmt.Sprintf("dernier   : %s   ·   prochain   : %s", last, next), contentW)),
 	)
 
 	// Tableau (fenêtre de défilement).
@@ -776,23 +883,70 @@ func (m model) View() string {
 		log = lb.String()
 	}
 
+	// Barre système : RAM et CPU totaux de la machine, + RAM cumulée des
+	// process surveillés.
+	var sumRSS uint64
+	for _, r := range m.rows {
+		sumRSS += r.rss
+	}
+	memPct := 0
+	if m.memTotal > 0 {
+		memPct = int(float64(m.memUsed) / float64(m.memTotal) * 100)
+	}
+	// Couleur selon la charge : vert < 75 % < orange < 90 % < rouge.
+	loadColor := func(p int) lipgloss.Color {
+		switch {
+		case p >= 90:
+			return cBad
+		case p >= 75:
+			return cWarn
+		default:
+			return cOk
+		}
+	}
+	val := func(s string, c lipgloss.Color) string {
+		return lipgloss.NewStyle().Foreground(c).Bold(true).Render(s)
+	}
+	sep := dimStyle.Render("   ·   ")
+	sysbar := "  " +
+		dimStyle.Render("RAM système : ") +
+		val(fmt.Sprintf("%s / %s", human(m.memUsed), human(m.memTotal)), cText) + " " +
+		val(fmt.Sprintf("(%d%%)", memPct), loadColor(memPct)) + sep +
+		dimStyle.Render("CPU système : ") +
+		val(fmt.Sprintf("%.0f%%", m.cpuPct), loadColor(int(m.cpuPct))) + sep +
+		dimStyle.Render("surveillés : ") +
+		val(human(sumRSS), cBorder)
+
 	var footer string
 	if m.confirming {
 		prompt := lipgloss.NewStyle().Foreground(cBad).Bold(true).Render(
 			fmt.Sprintf("  Tuer le process PID %d (%s) ?", m.confirmPID, m.confirmName))
-		footer = "\n" + prompt + dimStyle.Render("   y/o = confirmer · n/Échap = annuler")
+		footer = prompt + dimStyle.Render("   y/o = confirmer · n/Échap = annuler")
 	} else {
-		footer = "\n" + dimStyle.Render("  q quitter · espace/r rafraîchir · ↑/↓ sélection · x tuer · PgUp/PgDn page · g/G début/fin")
+		footer = dimStyle.Render("  q quitter · espace/r rafraîchir · ↑/↓ sélection · x tuer · PgUp/PgDn page · g/G début/fin")
 	}
 
-	return lipgloss.JoinVertical(
+	// Étire le cadre de l'en-tête sur toute la largeur du terminal.
+	box := boxStyle
+	if m.width > 6 {
+		box = box.Width(m.width - 2) // + bordure (2) = largeur du terminal
+	}
+
+	out := lipgloss.JoinVertical(
 		lipgloss.Left,
-		boxStyle.Render(header),
+		box.Render(header),
 		"",
 		b.String(),
 		log,
+		sysbar,
 		footer,
 	)
+	// Borne chaque ligne à la largeur du terminal (tronque proprement les
+	// lignes trop longues au lieu de les laisser se replier).
+	if m.width > 0 {
+		out = lipgloss.NewStyle().MaxWidth(m.width).Render(out)
+	}
+	return out
 }
 
 func main() {

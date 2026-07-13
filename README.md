@@ -16,6 +16,8 @@ L'affichage est un tableau de bord en terminal qui se rafraîchit en place.
 - Arrêt **manuel** d'un process sélectionné (avec confirmation).
 - Tableau de bord temps réel : mémoire par process, jauge d'usage, état.
 - Liste triée par usage mémoire décroissant, navigable et défilante.
+- Barre en bas d'écran : **RAM et CPU système** (utilisé/total, %) et RAM
+  cumulée des process surveillés.
 - **Notification desktop** quand un process atteint un seuil d'alerte
   (80 % par défaut, configurable).
 - Horodatage du **dernier** rafraîchissement et **compte à rebours** du prochain.
