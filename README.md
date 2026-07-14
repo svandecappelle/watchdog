@@ -51,7 +51,7 @@ Le plus simple, directement depuis GitHub (sans cloner le dépôt) — installe 
 binaire dans `$(go env GOPATH)/bin` (par défaut `~/go/bin`) :
 
 ```bash
-go install github.com/svandecappelle/linux-tools/cmd/watchdog@latest
+go install github.com/svandecappelle/watchdog/cmd/watchdog@latest
 ```
 
 Depuis un clone local, l'équivalent est :
