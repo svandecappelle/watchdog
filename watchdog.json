@@ -1,10 +1,14 @@
 {
-  "patterns": [
-    "/opt/Webex/bin/CiscoCollabHost"
-  ],
+  "patterns": [],
   "targets": [
-    { "pattern": "firefox", "limit": "5GiB" },
-    { "pattern": "/opt/Webex/bin/CiscoCollabHost", "limit": "1.250GiB" }
+    {
+      "pattern": "/opt/Webex/bin/CiscoCollabHost",
+      "limit": "1.250GiB"
+    },
+    {
+      "pattern": "firefox",
+      "limit": "5GiB"
+    }
   ],
   "limit": "3GiB",
   "interval": "5s",

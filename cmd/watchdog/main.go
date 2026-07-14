@@ -38,6 +38,8 @@ var (
 
 	notifyEnabled = true // notifications desktop activées
 	notifyPercent = 80   // seuil de notification, en % du seuil mémoire
+
+	groupProcs = true // regrouper les process sous leur process principal
 )
 
 // notifyFrac renvoie le seuil de notification sous forme de fraction (0.8 pour 80 %).
@@ -74,6 +76,7 @@ type config struct {
 
 	Notify        *bool `json:"notify"`         // activer les notifications desktop (défaut true)
 	NotifyPercent int   `json:"notify_percent"` // seuil de notification en % (défaut 80)
+	Group         *bool `json:"group"`          // regrouper par process principal (défaut true)
 }
 
 // loadConfig lit et applique un fichier de configuration JSON. Renvoie une
@@ -150,6 +153,9 @@ func loadConfig(path string, mustExist bool) error {
 	}
 	if c.NotifyPercent > 0 {
 		notifyPercent = c.NotifyPercent
+	}
+	if c.Group != nil {
+		groupProcs = *c.Group
 	}
 	return nil
 }
@@ -262,6 +268,29 @@ func cmdName(pid int) string {
 	return ""
 }
 
+// ppidOf lit le PID parent dans /proc/<pid>/stat. Le champ « comm » pouvant
+// contenir des espaces et des parenthèses, on découpe après la dernière ')'.
+func ppidOf(pid int) int {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0
+	}
+	s := string(data)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 || i+1 >= len(s) {
+		return 0
+	}
+	fields := strings.Fields(s[i+1:]) // [state ppid pgrp ...]
+	if len(fields) < 2 {
+		return 0
+	}
+	ppid, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return 0
+	}
+	return ppid
+}
+
 // alive teste l'existence d'un process (signal 0).
 func alive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 
@@ -326,12 +355,15 @@ func readCPU() (total, idle uint64) {
 // ─── Messages & commandes Bubble Tea ────────────────────────────────────────
 
 type procRow struct {
-	pid     int
-	rss     uint64
-	limit   uint64 // seuil applicable à ce process
-	name    string
-	pattern string
-	over    bool
+	pid       int
+	ppid      int
+	rss       uint64
+	limit     uint64 // seuil applicable à ce process
+	name      string
+	pattern   string
+	over      bool
+	depth     int // 0 = chef de groupe, 1 = sous-process
+	groupSize int // nombre de process dans le groupe (renseigné sur le chef)
 }
 
 type scanMsg struct {
@@ -364,21 +396,107 @@ func scan() tea.Msg {
 			continue // process disparu entre-temps
 		}
 		lim := limitOf(mt.pattern)
-		row := procRow{pid: pid, rss: rss, limit: lim, name: cmdName(pid), pattern: mt.pattern, over: rss > lim}
+		row := procRow{pid: pid, ppid: ppidOf(pid), rss: rss, limit: lim, name: cmdName(pid), pattern: mt.pattern, over: rss > lim}
 		if row.over {
 			events = append(events, terminate(pid, fmt.Sprintf("%s > seuil %s", human(rss), human(lim)))...)
 		}
 		rows = append(rows, row)
 	}
-	// Tri par défaut : usage mémoire décroissant (donc % décroissant), les
-	// process les plus gourmands en tête ; PID croissant à égalité.
+	if groupProcs {
+		rows = groupByMainProcess(rows)
+	} else {
+		sortByRSS(rows)
+	}
+	return scanMsg{rows: rows, events: events}
+}
+
+// sortByRSS trie les lignes par usage mémoire décroissant (PID croissant à
+// égalité), les process les plus gourmands en tête.
+func sortByRSS(rows []procRow) {
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].rss != rows[j].rss {
 			return rows[i].rss > rows[j].rss
 		}
 		return rows[i].pid < rows[j].pid
 	})
-	return scanMsg{rows: rows, events: events}
+}
+
+// groupByMainProcess regroupe chaque process sous son ancêtre le plus haut
+// présent dans l'ensemble surveillé (le « process principal »). Renvoie une
+// liste à plat ordonnée : groupes triés par mémoire totale décroissante ; au
+// sein d'un groupe, le chef d'abord puis ses sous-process par mémoire.
+func groupByMainProcess(rows []procRow) []procRow {
+	byPID := make(map[int]procRow, len(rows))
+	for _, r := range rows {
+		byPID[r.pid] = r
+	}
+	// leader(pid) : remonte la chaîne des parents tant qu'ils sont surveillés.
+	leader := func(pid int) int {
+		seen := map[int]bool{}
+		cur := pid
+		for !seen[cur] {
+			seen[cur] = true
+			parent, ok := byPID[cur]
+			if !ok {
+				break
+			}
+			if _, ok := byPID[parent.ppid]; !ok || parent.ppid == cur {
+				break
+			}
+			cur = parent.ppid
+		}
+		return cur
+	}
+
+	groups := map[int][]procRow{}
+	for _, r := range rows {
+		l := leader(r.pid)
+		groups[l] = append(groups[l], r)
+	}
+
+	type grp struct {
+		leader int
+		total  uint64
+		rows   []procRow
+	}
+	var gs []grp
+	for l, rs := range groups {
+		var total uint64
+		for _, r := range rs {
+			total += r.rss
+		}
+		gs = append(gs, grp{leader: l, total: total, rows: rs})
+	}
+	// Groupes triés par mémoire totale décroissante (PID du chef à égalité).
+	sort.Slice(gs, func(i, j int) bool {
+		if gs[i].total != gs[j].total {
+			return gs[i].total > gs[j].total
+		}
+		return gs[i].leader < gs[j].leader
+	})
+
+	out := make([]procRow, 0, len(rows))
+	for _, g := range gs {
+		// Sépare chef et sous-process, chacun trié par mémoire.
+		var head procRow
+		var kids []procRow
+		for _, r := range g.rows {
+			if r.pid == g.leader {
+				head = r
+			} else {
+				kids = append(kids, r)
+			}
+		}
+		sortByRSS(kids)
+		head.depth = 0
+		head.groupSize = len(g.rows)
+		out = append(out, head)
+		for _, k := range kids {
+			k.depth = 1
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // terminate arrête un process : SIGTERM, puis SIGKILL après le délai de grâce
@@ -413,13 +531,49 @@ func notifyCmd(messages []string) tea.Cmd {
 	}
 }
 
+// terminateGroup arrête plusieurs process en parallèle : SIGTERM à tous, une
+// seule attente du délai de grâce, puis SIGKILL des survivants. Le journal est
+// résumé (une poignée de lignes) plutôt qu'une ligne par PID. Appel bloquant.
+func terminateGroup(pids []int, label string) []string {
+	now := func() string { return time.Now().Format("15:04:05") }
+	var pending []int
+	for _, pid := range pids {
+		if alive(pid) {
+			pending = append(pending, pid)
+		}
+	}
+	if len(pending) == 0 {
+		return []string{fmt.Sprintf("%s  groupe %s déjà arrêté", now(), label)}
+	}
+	for _, pid := range pending {
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+	}
+	events := []string{fmt.Sprintf("%s  groupe %s : SIGTERM à %d process", now(), label, len(pending))}
+	time.Sleep(graceKill)
+	var survivors int
+	for _, pid := range pending {
+		if alive(pid) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			survivors++
+		}
+	}
+	if survivors > 0 {
+		events = append(events, fmt.Sprintf("%s  groupe %s : %d récalcitrant(s) — SIGKILL", now(), label, survivors))
+	}
+	events = append(events, fmt.Sprintf("%s  groupe %s arrêté (%d process)", now(), label, len(pending)))
+	return events
+}
+
 // killMsg est renvoyé par killCmd après un arrêt manuel.
 type killMsg struct{ events []string }
 
-// killCmd arrête manuellement un process dans une goroutine.
-func killCmd(pid int, label string) tea.Cmd {
+// killCmd arrête manuellement un process (ou tout un groupe) dans une goroutine.
+func killCmd(pids []int, label string) tea.Cmd {
 	return func() tea.Msg {
-		return killMsg{events: terminate(pid, "kill manuel — "+label)}
+		if len(pids) > 1 {
+			return killMsg{events: terminateGroup(pids, label)}
+		}
+		return killMsg{events: terminate(pids[0], "kill manuel — "+label)}
 	}
 }
 
@@ -435,8 +589,8 @@ type model struct {
 	scroll      int          // index de la première ligne de process affichée
 	cursor      int          // index de la ligne sélectionnée
 	confirming  bool         // en attente de confirmation d'un kill manuel
-	confirmPID  int          // PID visé par la confirmation en cours
-	confirmName string       // nom du process visé (affichage)
+	confirmPIDs []int        // PID(s) visés par la confirmation (>1 = groupe)
+	confirmName string       // nom du process/groupe visé (affichage)
 	notified    map[int]bool // PID déjà notifiés au-dessus du seuil (anti-spam)
 	width       int          // dimensions du terminal (0 tant qu'inconnues)
 	height      int
@@ -528,6 +682,24 @@ func (m model) selectedPID() int {
 	return 0
 }
 
+// killTargets renvoie les PID à arrêter pour la sélection courante : si la ligne
+// est un chef de groupe (avec sous-process), tout le groupe (chef + sous-process
+// contigus) ; sinon le seul process sélectionné.
+func (m model) killTargets() []int {
+	if m.cursor < 0 || m.cursor >= len(m.rows) {
+		return nil
+	}
+	r := m.rows[m.cursor]
+	if r.depth == 0 && r.groupSize > 1 {
+		pids := []int{r.pid}
+		for j := m.cursor + 1; j < len(m.rows) && m.rows[j].depth > 0; j++ {
+			pids = append(pids, m.rows[j].pid)
+		}
+		return pids
+	}
+	return []int{r.pid}
+}
+
 func (m model) Init() tea.Cmd { return tea.Batch(scan, uiTick()) }
 
 // checkNotifications détecte les process qui viennent de franchir le seuil de
@@ -580,9 +752,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.confirming {
 			switch key {
 			case "y", "o", "enter":
-				pid, name := m.confirmPID, m.confirmName
+				pids, name := m.confirmPIDs, m.confirmName
 				m.confirming = false
-				return m, killCmd(pid, name)
+				return m, killCmd(pids, name)
 			default: // n, esc, ou n'importe quelle autre touche : annulation
 				m.confirming = false
 				return m, nil
@@ -623,10 +795,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ensureVisible()
 			return m, nil
 		case "x", "delete":
-			// Demande de confirmation d'arrêt du process sélectionné.
-			if pid := m.selectedPID(); pid != 0 {
+			// Demande de confirmation d'arrêt : process seul, ou tout le groupe
+			// si un chef de groupe est sélectionné.
+			if pids := m.killTargets(); len(pids) > 0 {
 				m.confirming = true
-				m.confirmPID = pid
+				m.confirmPIDs = pids
 				m.confirmName = progLabel(m.rows[m.cursor])
 			}
 			return m, nil
@@ -729,6 +902,9 @@ func human(b uint64) string {
 	}
 }
 
+// progColW est la largeur de la colonne PROGRAMME.
+const progColW = 24
+
 // progLabel renvoie un nom court et lisible pour un process : le nom de base de
 // l'exécutable, ou à défaut celui du motif, tronqué pour tenir dans la colonne.
 func progLabel(r procRow) string {
@@ -736,11 +912,7 @@ func progLabel(r procRow) string {
 	if name == "" || name == "." || name == "/" {
 		name = filepath.Base(r.pattern)
 	}
-	const max = 16
-	if len(name) > max {
-		name = name[:max-1] + "…"
-	}
-	return name
+	return clip(name, progColW)
 }
 
 // bar dessine une jauge colorée selon le taux de remplissage.
@@ -816,7 +988,8 @@ func (m model) View() string {
 	end := min(total, start+visible)
 
 	var b strings.Builder
-	b.WriteString(headStyle.Render("  PID      PROGRAMME         MÉMOIRE       USAGE                            ÉTAT") + "\n")
+	b.WriteString(headStyle.Render(fmt.Sprintf("  %-7s  %-*s  MÉMOIRE       USAGE                            ÉTAT",
+		"PID", progColW, "PROGRAMME")) + "\n")
 	if total == 0 {
 		b.WriteString(dimStyle.Render("  (aucun process ne correspond aux motifs)") + "\n")
 	}
@@ -841,7 +1014,18 @@ func (m model) View() string {
 		// Champs à largeur fixe (formatés avant toute coloration pour préserver
 		// l'alignement, la coloration ajoutant des séquences ANSI invisibles).
 		pidField := fmt.Sprintf("%-7d", r.pid)
-		progField := fmt.Sprintf("%-16s", progLabel(r))
+		// Colonne PROGRAMME : sous-process indentés en arbre, chef annoté du
+		// nombre de process de son groupe.
+		name := progLabel(r)
+		progText := name
+		switch {
+		case r.depth > 0:
+			progText = "└ " + clip(name, progColW-2)
+		case r.groupSize > 1:
+			suffix := fmt.Sprintf(" (%d)", r.groupSize)
+			progText = clip(name, progColW-len(suffix)) + suffix
+		}
+		progField := fmt.Sprintf("%-*s", progColW, clip(progText, progColW))
 		mem := lipgloss.NewStyle().Foreground(memColor).Render(fmt.Sprintf("%-12s", human(r.rss)))
 
 		marker := "  "
@@ -919,8 +1103,13 @@ func (m model) View() string {
 
 	var footer string
 	if m.confirming {
-		prompt := lipgloss.NewStyle().Foreground(cBad).Bold(true).Render(
-			fmt.Sprintf("  Tuer le process PID %d (%s) ?", m.confirmPID, m.confirmName))
+		var q string
+		if n := len(m.confirmPIDs); n > 1 {
+			q = fmt.Sprintf("  Tuer le groupe « %s » et ses %d process ?", m.confirmName, n)
+		} else {
+			q = fmt.Sprintf("  Tuer le process PID %d (%s) ?", m.confirmPIDs[0], m.confirmName)
+		}
+		prompt := lipgloss.NewStyle().Foreground(cBad).Bold(true).Render(q)
 		footer = prompt + dimStyle.Render("   y/o = confirmer · n/Échap = annuler")
 	} else {
 		footer = dimStyle.Render("  q quitter · espace/r rafraîchir · ↑/↓ sélection · x tuer · PgUp/PgDn page · g/G début/fin")

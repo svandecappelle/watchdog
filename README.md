@@ -16,6 +16,8 @@ L'affichage est un tableau de bord en terminal qui se rafraîchit en place.
 - Arrêt **manuel** d'un process sélectionné (avec confirmation).
 - Tableau de bord temps réel : mémoire par process, jauge d'usage, état.
 - Liste triée par usage mémoire décroissant, navigable et défilante.
+- **Regroupement par process principal** : les sous-process (onglets d'un
+  navigateur, etc.) sont indentés sous leur process parent.
 - Barre en bas d'écran : **RAM et CPU système** (utilisé/total, %) et RAM
   cumulée des process surveillés.
 - **Notification desktop** quand un process atteint un seuil d'alerte
@@ -52,7 +54,7 @@ go build -o watchdog ./cmd/watchdog
 | `↑`/`↓`, `k`/`j`       | Déplacer la sélection d'une ligne             |
 | `PgUp`/`PgDn`, `b`/`f` | Déplacer la sélection d'une page              |
 | `g` / `G`              | Aller au début / à la fin de la liste         |
-| `x`, `Suppr`           | Tuer le process sélectionné (avec confirmation) |
+| `x`, `Suppr`           | Tuer le process (ou le groupe) sélectionné (avec confirmation) |
 
 Quand les process à surveiller sont plus nombreux que la hauteur du terminal,
 la liste défile : une ligne d'état indique la position (`lignes 3–11 / 221`) et
@@ -67,6 +69,12 @@ apparaît en bas de l'écran. Appuyez sur `y` (ou `o`) pour confirmer l'arrêt,
 automatique : `SIGTERM`, puis `SIGKILL` après le délai de grâce si le process
 résiste. La sélection reste sur le même process d'un rafraîchissement à l'autre,
 malgré le ré-ordonnancement par usage mémoire.
+
+Si la ligne sélectionnée est un **chef de groupe** (avec des sous-process), la
+confirmation propose de tuer **tout le groupe** (chef + sous-process). Le
+`SIGTERM` est alors envoyé à tous d'un coup, puis, après un unique délai de
+grâce, le `SIGKILL` aux éventuels survivants. Sélectionner un sous-process
+individuel ne tue que celui-ci.
 
 ## Configuration
 
@@ -101,6 +109,7 @@ défaut.
 | `max_rows`   | `int`      | `0`                                 | Plafond de lignes de process affichées. `0` = auto (s'ajuste à la hauteur du terminal). |
 | `notify`     | `bool`     | `true`                              | Activer les notifications desktop d'alerte.                       |
 | `notify_percent` | `int`  | `80`                                | Seuil d'alerte, en % du seuil mémoire, déclenchant une notification. |
+| `group`      | `bool`     | `true`                              | Regrouper les process sous leur process principal (parent surveillé le plus haut). |
 
 ### Seuils par programme
 
@@ -143,6 +152,20 @@ une notification desktop est émise via [beeep](https://github.com/gen2brain/bee
 tracée dans le journal (`⚠ …`). Une notification n'est envoyée qu'une fois par
 franchissement : un process repassé sous le seuil pourra à nouveau alerter s'il
 le refranchit. Mettre `"notify": false` désactive complètement les notifications.
+
+## Regroupement par process principal
+
+Quand `group` est activé (défaut), chaque process est rattaché à son ancêtre le
+plus haut **présent parmi les process surveillés** — son « process principal ».
+Les groupes sont triés par mémoire totale décroissante ; au sein d'un groupe, le
+chef apparaît en premier (annoté du nombre de process du groupe, ex. `firefox
+(27)`), suivi de ses sous-process indentés (`└ …`).
+
+C'est particulièrement utile pour les navigateurs, dont chaque onglet est un
+process séparé : ils se regroupent sous le process principal. Notez que si un
+motif est très large (ex. `/usr`), l'ancêtre commun peut remonter jusqu'à un
+process de session — préférez des motifs applicatifs précis. Mettre
+`"group": false` revient à une liste à plat triée par mémoire.
 
 ## Fonctionnement
 
