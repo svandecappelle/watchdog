@@ -107,7 +107,7 @@ Adaptez `gnome-terminal --` à votre émulateur (`konsole -e`, `xterm -e`,
 ## Utilisation
 
 ```bash
-# Avec le fichier de config par défaut (watchdog.json dans le dossier courant)
+# Avec le fichier de config par défaut (voir l'ordre de recherche ci-dessous)
 ./watchdog
 
 # Avec un fichier de config explicite
@@ -116,6 +116,15 @@ Adaptez `gnome-terminal --` à votre émulateur (`konsole -e`, `xterm -e`,
 # En surchargeant les motifs directement (prioritaire sur la config)
 ./watchdog /opt/Webex/bin/CiscoCollabHost /usr/lib/firefox/firefox
 ```
+
+Sans `-config`, le fichier de configuration est cherché dans l'ordre suivant, le
+premier trouvé étant utilisé :
+
+1. `$XDG_CONFIG_HOME/watchdog/watchdog.json` (soit `$HOME/.config/watchdog/watchdog.json`) ;
+2. `./watchdog.json` (dossier courant).
+
+Si aucun n'existe, les valeurs par défaut compilées sont utilisées. Un chemin
+passé via `-config` est prioritaire et doit exister.
 
 ### Raccourcis clavier
 
@@ -150,7 +159,8 @@ individuel ne tue que celui-ci.
 
 ## Configuration
 
-Les paramètres se règlent dans un fichier JSON (`watchdog.json` par défaut).
+Les paramètres se règlent dans un fichier JSON (cherché dans
+`$HOME/.config/watchdog/watchdog.json` puis `./watchdog.json`, ou via `-config`).
 Tous les champs sont **optionnels** : un champ absent conserve sa valeur par
 défaut.
 

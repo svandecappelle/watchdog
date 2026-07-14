@@ -62,6 +62,23 @@ type target struct {
 	Limit   string `json:"limit"`   // seuil propre (optionnel ; sinon "limit" global)
 }
 
+// defaultConfigPath cherche un fichier de configuration aux emplacements par
+// défaut, dans l'ordre : $HOME/.config/watchdog/watchdog.json (ou
+// $XDG_CONFIG_HOME/…), puis ./watchdog.json. Renvoie le premier existant.
+func defaultConfigPath() (string, bool) {
+	var candidates []string
+	if dir, err := os.UserConfigDir(); err == nil {
+		candidates = append(candidates, filepath.Join(dir, "watchdog", "watchdog.json"))
+	}
+	candidates = append(candidates, "watchdog.json")
+	for _, p := range candidates {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p, true
+		}
+	}
+	return "", false
+}
+
 // config reflète le fichier JSON. Tous les champs sont optionnels : un champ
 // absent ou vide conserve la valeur par défaut ci-dessus.
 type config struct {
@@ -1140,16 +1157,23 @@ func (m model) View() string {
 
 func main() {
 	// Priorité : valeurs par défaut < fichier de config < arguments positionnels.
-	const defaultConfig = "watchdog.json"
-	cfgPath := flag.String("config", defaultConfig, "chemin du fichier de configuration JSON")
+	cfgPath := flag.String("config", "",
+		"chemin du fichier de configuration JSON (défaut : $HOME/.config/watchdog/watchdog.json puis ./watchdog.json)")
 	flag.Parse()
 
-	// Le fichier n'est obligatoire que si l'utilisateur l'a explicitement demandé.
-	mustExist := *cfgPath != defaultConfig
-	if err := loadConfig(*cfgPath, mustExist); err != nil {
-		fmt.Fprintln(os.Stderr, "erreur:", err)
-		os.Exit(1)
+	if *cfgPath != "" {
+		// Chemin explicite : le fichier est obligatoire.
+		if err := loadConfig(*cfgPath, true); err != nil {
+			fmt.Fprintln(os.Stderr, "erreur:", err)
+			os.Exit(1)
+		}
+	} else if path, found := defaultConfigPath(); found {
+		if err := loadConfig(path, true); err != nil {
+			fmt.Fprintln(os.Stderr, "erreur:", err)
+			os.Exit(1)
+		}
 	}
+	// Aucun fichier trouvé : on garde les valeurs par défaut.
 
 	// Les arguments positionnels restants surchargent les motifs.
 	if args := flag.Args(); len(args) > 0 {
